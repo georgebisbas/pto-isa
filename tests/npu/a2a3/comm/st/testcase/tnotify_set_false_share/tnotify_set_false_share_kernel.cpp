@@ -50,6 +50,8 @@ See LICENSE in the root of the software repository for the full text of the Lice
 #define AICORE [aicore]
 #endif
 
+#include <pto/pto-inst.hpp>
+#include "pto/common/pto_tile.hpp"
 #include "../common.hpp"
 
 // HCCL keeps a sync prefix at the start of the window (tnotify uses the same).
@@ -57,25 +59,11 @@ static constexpr size_t HCCL_WIN_SYNC_PREFIX = 64 * sizeof(int32_t);
 static constexpr int32_t kSlotBase = 1000;
 static constexpr int kIters = 50; // bursty race: one iter is not a verdict
 
-// Must match TNOTIFY_IMPL NotifyOp::Set in include/pto/comm/a2a3/TNotify.hpp.
-// Word-safe Set: atomic add of wrapping (value - current). a2a3 has no
-// atomic-store op (set_st_atomic_cfg op range is [0,0] = SUM only). Inlined
-// so stock CANN bisheng can compile this without --cce-pto-enable.
-AICORE inline void TNotifySet(__gm__ int32_t* ptr, int32_t value)
-{
-    const uint32_t old = ld_dev(reinterpret_cast<__gm__ uint32_t*>(ptr), 0);
-    const int32_t delta = static_cast<int32_t>(static_cast<uint32_t>(value) - old);
-    set_st_atomic_cfg(ATOMIC_S32, ATOMIC_SUM);
-    __asm__ __volatile__("");
-    dcci(ptr, cache_line_t::SINGLE_CACHE_LINE);
-    __asm__ __volatile__("");
-    st_atomic<int32_t>(delta, ptr);
-    __asm__ __volatile__("");
-    dcci(ptr, cache_line_t::SINGLE_CACHE_LINE);
-    __asm__ __volatile__("");
-    dsb(DSB_DDR);
-    pipe_barrier(PIPE_ALL);
-}
+// Device path goes through the *real* pto::comm::TNOTIFY, so this ST exercises
+// the shipped NotifyOp::Set in include/pto/comm/a2a3/TNotify.hpp rather than a
+// hand-copied mirror of it: a change to the header has to move this test.
+// (An inlined copy was used before to dodge the harness's --cce-pto-enable; the
+// real intrinsic compiles without that flag, as tnotify itself does.)
 
 __global__ AICORE void WindowMemInit(__gm__ int32_t* ptr, int32_t value, int count)
 {
@@ -102,7 +90,8 @@ __global__ AICORE void TNotifySetFalseShareKernel(
     (void)nranks;
     int my_rank = static_cast<int>(hcclCtx->rankId);
     __gm__ int32_t* rank0_slots = CommRemotePtr(hcclCtx, slots, /*pe=*/0);
-    TNotifySet(rank0_slots + my_rank * slot_stride, slot_base + my_rank);
+    pto::comm::Signal slot_signal(rank0_slots + my_rank * slot_stride);
+    pto::comm::TNOTIFY(slot_signal, slot_base + my_rank, pto::comm::NotifyOp::Set);
 }
 
 static bool RunSetFalseShareKernel(

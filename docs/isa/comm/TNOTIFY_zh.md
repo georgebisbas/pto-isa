@@ -37,8 +37,11 @@ PTO_INST void TNOTIFY(GlobalSignalData &dstSignalData, int32_t value, NotifyOp o
 - **内存约束**：
     - `dstSignalData` 必须指向远端地址（目标NPU）。
     - `dstSignalData` 应4字节对齐。
+    - `dstSignalData` 必须对该 rank **可读**：`NotifyOp::Set` 发布前会先读取当前值
+      （见下方语义），因此不支持只写的远端映射。
 - **操作语义**：
-    - `NotifyOp::Set`：按字发布 `value`（不是整行 `dcci` 回写）。a2a3 上 `st_atomic` 只接受 `ATOMIC_SUM`，因此实现为对 `(value - current)` 的原子加。同一地址上的并发 Set 有竞争。
+    - `NotifyOp::Set`：按字发布 `value`：返回时目标字恰好等于 `value`，与该字共享 64 B cache line 的其它字不受影响（整行 `dcci` 回写会破坏它们）。a2a3 上 `st_atomic` 只接受 `ATOMIC_SUM`，因此实现为对回绕差值 `(value - current)` 的原子加。
+    - **每个地址只能有一个写入者（并发）**：同一字上的并发 `Set` 不保证“最后写入者胜出”。每个写入者都会重新读取并重新发布，因此各 delta 的累加可能落在任何 rank 都未写入过的值上——两个分别写 `1000` 和 `1001` 的 rank 竞争后可能留下 `2001`。请为每个发布 rank 分配独立的字（例如每 rank 一个槽位）。
     - `NotifyOp::AtomicAdd`：使用 `st_atomic` 指令执行硬件原子加。
 
 ## 示例
@@ -96,3 +99,14 @@ void consumer(__gm__ int32_t* local_flag) {
     // ... 消费数据 ...
 }
 ```
+
+## 说明
+
+- **按字发布的 `Set` 有测试覆盖**：`tests/npu/a2a3/comm/st/testcase/tnotify_set_false_share`
+  校验 `Set` 不会影响与其共享 64 B cache line 的相邻字；`tnotify`（`RuntimeOp_Set`）
+  校验每个发布 rank 使用独立槽位。
+- **本头文件在 CANN 中另有一份副本。** CANN 还以扁平路径提供该副本：
+  `$ASCEND_HOME_PATH/aarch64-linux/include/pto/comm/TNotify.hpp`（无 `a2a3/` 路径层级）。
+  CANN 9.0.0 中的副本仍是修复前的 `Set`（先对整行 `dcci` 失效，再做普通按字存储），
+  因此若 include 顺序先命中 CANN，或下游直接分发 CANN 的目录，则会继续保留旧行为。
+  修改本头文件后需在下游重新带入（re-vendor）。

@@ -75,7 +75,13 @@ set(CMAKE_CCE_COMPILE_OPTIONS
     "SHELL:-mllvm -cce-aicore-addr-transform"
     "SHELL:-mllvm -cce-aicore-dcci-insert-for-scalar=false"
 )
-set(CMAKE_CCE_COMPILE_OPTIONS "${CMAKE_CCE_COMPILE_OPTIONS} --cce-pto-enable")
+# --cce-pto-enable requires the PTO-enabled bisheng (ptoas). Stock CANN bisheng
+# rejects it. Set PTO_ISA_NO_PTO_ENABLE=1 to build STs on a stock toolchain.
+if(NOT DEFINED ENV{PTO_ISA_NO_PTO_ENABLE})
+    set(CMAKE_CCE_COMPILE_OPTIONS "${CMAKE_CCE_COMPILE_OPTIONS} --cce-pto-enable")
+else()
+    message(STATUS "PTO_ISA_NO_PTO_ENABLE=1: building comm ST without --cce-pto-enable")
+endif()
 
 set(CMAKE_CPP_COMPILE_OPTIONS
     -xc++

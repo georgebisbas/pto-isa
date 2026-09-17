@@ -135,9 +135,11 @@ __global__ AICORE void TNotifyRuntimeOpKernel(
     int my_rank = static_cast<int>(hcclCtx->rankId);
     int target_rank = 0;
 
-    // Get remote PE's counter address
-    __gm__ int32_t* remote_counter = CommRemotePtr(hcclCtx, shmem_counter, target_rank);
-    pto::comm::Signal counterSignal(remote_counter);
+    // One slot per writer. NotifyOp::Set is word-safe but is specified for a
+    // single writer per address (see docs/isa/comm/TNOTIFY.md), so every rank
+    // publishes into its own slot instead of racing on one shared word.
+    __gm__ int32_t* remote_slot = CommRemotePtr(hcclCtx, shmem_counter + my_rank, target_rank);
+    pto::comm::Signal counterSignal(remote_slot);
 
     // Use runtime-specified NotifyOp (Set operation)
     pto::comm::TNOTIFY(counterSignal, my_rank + 1, pto::comm::NotifyOp::Set);
@@ -342,9 +344,10 @@ bool RunNotifyRuntimeOpKernel(
     size_t winOffset = 0;
     WindowAlloc(localWinBase, winOffset, HCCL_WIN_SYNC_PREFIX);
 
-    int32_t* shmem_counter = (int32_t*)WindowAlloc(localWinBase, winOffset, sizeof(int32_t));
+    // One slot per writer (see TNotifyRuntimeOpKernel).
+    int32_t* shmem_counter = (int32_t*)WindowAlloc(localWinBase, winOffset, sizeof(int32_t) * n_ranks);
 
-    WindowMemInit<<<1, nullptr, ctx.stream>>>(shmem_counter, 0, 1);
+    WindowMemInit<<<1, nullptr, ctx.stream>>>(shmem_counter, 0, n_ranks);
     aclrtSynchronizeStream(ctx.stream);
 
     HcclHostBarrier(ctx.comm, ctx.stream);
@@ -359,24 +362,29 @@ bool RunNotifyRuntimeOpKernel(
     if (rank_id == 0) {
         int32_t* result_dev = nullptr;
         aclrtMalloc(reinterpret_cast<void**>(&result_dev), sizeof(int32_t), ACL_MEM_MALLOC_HUGE_FIRST);
-        WindowMemRead<<<1, nullptr, ctx.stream>>>(result_dev, shmem_counter, 1);
-        aclrtSynchronizeStream(ctx.stream);
 
-        int32_t result = 0;
-        aclrtMemcpy(&result, sizeof(int32_t), result_dev, sizeof(int32_t), ACL_MEMCPY_DEVICE_TO_HOST);
+        // Every rank wrote rank_id + 1 into its own slot; each slot must hold
+        // exactly that value (no cross-rank overwrite is possible by contract).
+        for (int i = 0; i < n_ranks; ++i) {
+            WindowMemRead<<<1, nullptr, ctx.stream>>>(result_dev, shmem_counter + i, 1);
+            aclrtSynchronizeStream(ctx.stream);
+
+            int32_t result = 0;
+            aclrtMemcpy(&result, sizeof(int32_t), result_dev, sizeof(int32_t), ACL_MEMCPY_DEVICE_TO_HOST);
+
+            if (result != i + 1) {
+                std::cerr << "RuntimeOp Set test failed! slot " << i << " = " << result << ", expected " << (i + 1)
+                          << std::endl;
+                is_ok = false;
+            }
+        }
         aclrtFree(result_dev);
 
-        // For 2 ranks, both set their rank_id + 1, last writer wins
-        // Result depends on timing, should be either 1 or 2
-        if (result < 1 || result > n_ranks) {
-            std::cerr << "RuntimeOp Set test failed! Got unexpected value: " << result << std::endl;
-            is_ok = false;
-        }
 #if ENABLE_DEBUG_PRINT
-        else {
+        if (is_ok) {
             std::cout << "\n================================================================" << std::endl;
             std::cout << "[DEBUG] Rank 0: TNOTIFY RuntimeOp (Set) SUCCESSFUL!" << std::endl;
-            std::cout << "Counter = " << result << " (last writer wins)" << std::endl;
+            std::cout << "Each rank's slot holds rank_id + 1 (one writer per word)" << std::endl;
             std::cout << "================================================================\n" << std::endl;
         }
 #endif
