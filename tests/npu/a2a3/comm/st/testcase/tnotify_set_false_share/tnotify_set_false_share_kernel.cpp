@@ -76,6 +76,12 @@ __global__ AICORE void WindowMemInit(__gm__ int32_t* ptr, int32_t value, int cou
 __global__ AICORE void WindowMemRead(__gm__ int32_t* dst, __gm__ int32_t* src, int count)
 {
     for (int i = 0; i < count; ++i) {
+        // Read the peer-written slot the way a consumer does: drop the line
+        // before loading it (same invalidate-then-load as the TWAIT poll loop),
+        // otherwise a cached copy of a line another NPU wrote can hide the value.
+        __asm__ __volatile__("");
+        dcci(static_cast<__gm__ void*>(src + i), cache_line_t::SINGLE_CACHE_LINE);
+        __asm__ __volatile__("");
         dst[i] = src[i];
     }
     pipe_barrier(PIPE_ALL);
