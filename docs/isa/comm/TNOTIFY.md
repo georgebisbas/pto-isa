@@ -45,6 +45,15 @@ PTO_INST void TNOTIFY(GlobalSignalData &dstSignalData, int32_t value, NotifyOp o
     - **One writer per word (concurrency)**: concurrent `Set`s to the *same* word are not last-writer-wins. Every writer re-reads the word and re-publishes, so the accumulating deltas can leave a value no rank ever wrote - two writers racing with `1000` and `1001` can leave `2001`. Give each publishing rank its own word (e.g. one slot per rank).
     - `NotifyOp::AtomicAdd`: Hardware atomic add using `st_atomic` instruction.
 
+## Concurrency and cache-line granularity
+
+GM writes reach DDR a whole 64-byte cache line at a time, so a publication that dirties the target line writes the neighbouring words back with it. On A2/A3 that makes line ownership the caller's business: signals concurrently updated by different AIVs or NPUs must occupy **separate 64-byte cache lines** - each signal 64-byte aligned with a stride of at least 64 bytes. Notifications executed serially by the same AIV are exempt (see the rule as restated in hw-native-sys/pto-isa#322; cache-line length per the Ascend scalar-unit documentation). The same rule is already encoded for the soft-SYNCALL workspace (`SYNCALL_SOFT_WORKSPACE_INT32 = 16` in `pto/common/type.hpp`) and is what pypto restates to kernel authors for concurrent scalar writes.
+
+`NotifyOp::Set` does not need that padding, because it publishes the word **without dirtying the line** (see the semantics above): packed `int32` signals are safe - measured 0/50 failures at P=2 and P=4 with the default stride, while the cache-line stride (16 x `int32` = 64 B) stays 0/50. Two consequences:
+
+- Callers that follow the 64-byte discipline are unaffected, and the rule stays mandatory for every *store-based* publication path (plain scalar stores, SYNCALL, `pl.write`-style writes), where a whole-line write-back can still clobber neighbours.
+- `Set` is line-safe only with respect to the **issuer's own** stores: an AIV that also stores into the line carrying a signal it notifies can still clean that line and clobber a peer's published word. Keep payload stores on their own lines.
+
 ## Examples
 
 ### Basic Set Notification

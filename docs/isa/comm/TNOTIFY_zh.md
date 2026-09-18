@@ -44,6 +44,15 @@ PTO_INST void TNOTIFY(GlobalSignalData &dstSignalData, int32_t value, NotifyOp o
     - **每个地址只能有一个写入者（并发）**：同一字上的并发 `Set` 不保证“最后写入者胜出”。每个写入者都会重新读取并重新发布，因此各 delta 的累加可能落在任何 rank 都未写入过的值上——两个分别写 `1000` 和 `1001` 的 rank 竞争后可能留下 `2001`。请为每个发布 rank 分配独立的字（例如每 rank 一个槽位）。
     - `NotifyOp::AtomicAdd`：使用 `st_atomic` 指令执行硬件原子加。
 
+## 并发与 cache line 粒度
+
+GM 写入以整条 64 字节 cache line 到达 DDR，因此若发布操作弄脏了目标行，会把同一行中的相邻字一并写回。在 A2/A3 上，行归属由调用方负责：由不同 AIV 或 NPU 并发更新的信号必须各自独占 **64 字节 cache line**——64 字节对齐、步长不小于 64 字节；由同一个 AIV 串行执行的多次通知不受此限制（规则见 hw-native-sys/pto-isa#322；cache line 长度见 Ascend 标量单元文档）。软 SYNCALL 工作区已经编码了该规则（`pto/common/type.hpp` 中的 `SYNCALL_SOFT_WORKSPACE_INT32 = 16`），pypto 也以同样的规则提示并发标量写入。
+
+`NotifyOp::Set` 不需要这种填充，因为它**不会弄脏目标行**（见上方语义）：紧密排列的 `int32` 信号是安全的——在 P=2 与 P=4 下以默认步长实测 0/50 失败，而以 cache line 为步长（16 × `int32` = 64 B）同样保持 0/50。由此有两点：
+
+- 遵循 64 字节约定的调用方不受影响；对所有**基于普通存储**的发布路径（普通标量存储、SYNCALL、`pl.write` 风格的写入），该规则仍然是必需的，因为整行回写依然可能破坏相邻字。
+- `Set` 只对其**自身**的存储保持行安全：若某个 AIV 还向承载其所通知信号的那一行写入数据，仍可能清理该行并破坏对端已发布的值。请把数据写入放在独立的行上。
+
 ## 示例
 
 ### 基础Set通知
